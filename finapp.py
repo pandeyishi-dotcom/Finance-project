@@ -1,6 +1,5 @@
 # ============================================================
-# INDIAN MACRO EVENT & RISK ANALYTICS LAB
-# WITH SIDEBAR MACRO DASHBOARD
+# INDIAN MACRO EVENT – REAL-TIME ANALYTICS DASHBOARD
 # ============================================================
 
 import streamlit as st
@@ -9,7 +8,9 @@ import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
-from datetime import timedelta
+from datetime import datetime, timedelta
+import pytz
+import time
 
 # ---------------- PAGE CONFIG ----------------
 st.set_page_config(
@@ -17,6 +18,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ---------------- TIMEZONES ----------------
+IST = pytz.timezone("Asia/Kolkata")
 
 # ---------------- CONSTANTS ----------------
 ASSETS = {
@@ -60,7 +64,7 @@ def load_rbi_mpc():
     df["Date"] = pd.to_datetime(df["Date"])
     return df
 
-# ---------------- HELPERS ----------------
+# ---------------- MACRO LOGIC ----------------
 def inflation_regime(cpi):
     if cpi >= 6:
         return "High Inflation"
@@ -69,6 +73,23 @@ def inflation_regime(cpi):
     else:
         return "Mid Regime"
 
+def get_release_time(event_date, hour=17, minute=30):
+    return IST.localize(datetime(
+        event_date.year, event_date.month, event_date.day, hour, minute
+    ))
+
+def macro_state(event_date):
+    now = datetime.now(IST)
+    release = get_release_time(event_date)
+
+    if now < release:
+        return "PRE-EVENT"
+    elif release <= now <= release + timedelta(minutes=60):
+        return "LIVE"
+    else:
+        return "POST-EVENT"
+
+# ---------------- MARKET DATA ----------------
 def get_market_data(ticker, event_date):
     now = pd.Timestamp.utcnow().tz_localize(None)
     event_date = pd.to_datetime(event_date)
@@ -117,6 +138,7 @@ def reaction_return(df):
     except:
         return np.nan
 
+# ---------------- RISK FUNCTIONS ----------------
 @st.cache_data
 def daily_returns(ticker):
     df = yf.download(ticker, period="5y", interval="1d", progress=False)
@@ -125,63 +147,62 @@ def daily_returns(ticker):
 def var_95(returns):
     return np.percentile(returns, 5)
 
-# ================= SIDEBAR: MACRO DASHBOARD =================
+# ================= SIDEBAR =================
 st.sidebar.title("📊 Macro Dashboard")
 
 cpi = load_cpi_events()
 mpc = load_rbi_mpc()
 cpi["Regime"] = cpi["Actual"].apply(inflation_regime)
 
-event_type = st.sidebar.radio(
-    "Event Type",
-    ["CPI Release", "RBI MPC"]
-)
+event_type = st.sidebar.radio("Event Type", ["CPI Release", "RBI MPC"])
 
 if event_type == "CPI Release":
-    event_date = st.sidebar.selectbox(
-        "CPI Release Date",
-        cpi["Date"]
-    )
+    event_date = st.sidebar.selectbox("CPI Date", cpi["Date"])
     row = cpi[cpi["Date"] == event_date].iloc[0]
-    st.sidebar.metric("Inflation (%)", row["Actual"])
-    st.sidebar.metric("CPI Surprise", round(row["Surprise"], 2))
-    st.sidebar.markdown(f"**Regime:** {row['Regime']}")
+    st.sidebar.metric("Inflation", row["Actual"])
+    st.sidebar.metric("Surprise", round(row["Surprise"], 2))
+    st.sidebar.metric("Regime", row["Regime"])
 else:
-    event_date = st.sidebar.selectbox(
-        "RBI MPC Date",
-        mpc["Date"]
-    )
-    st.sidebar.metric("Policy Event", "Rate Decision")
+    event_date = st.sidebar.selectbox("MPC Date", mpc["Date"])
+    st.sidebar.metric("Policy Event", "RBI Rate Decision")
 
-selected_assets = st.sidebar.multiselect(
-    "Assets to Track",
+state = macro_state(event_date)
+st.sidebar.subheader("⏱ Macro Status")
+st.sidebar.metric("State", state)
+
+assets_selected = st.sidebar.multiselect(
+    "Assets",
     list(ASSETS.keys()),
     default=list(ASSETS.keys())
 )
 
-risk_mode = st.sidebar.selectbox(
-    "Risk Lens",
+mode = st.sidebar.selectbox(
+    "Analysis Mode",
     ["Event Reaction", "Macro VaR", "Stress Test"]
 )
 
-# ================= MAIN DASHBOARD =================
-st.title("🇮🇳 Indian Macro Analytics Dashboard")
-st.caption("Cross-Asset • Regime-Aware • Risk-Focused")
+# ================= MAIN =================
+st.title("🇮🇳 Indian Macro Analytics System")
+st.caption("Event-Driven • Regime-Aware • Real-Time Capable")
 
-# ---------- EVENT REACTION ----------
-if risk_mode == "Event Reaction":
+# ---------------- AUTO REFRESH ----------------
+if state == "LIVE":
+    time.sleep(30)
+    st.experimental_rerun()
+
+# ---------------- EVENT REACTION ----------------
+if mode == "Event Reaction":
     st.subheader("📈 Cross-Asset Event Reaction")
 
-    fig, axes = plt.subplots(len(selected_assets), 1, figsize=(10, 7), sharex=True)
-    if len(selected_assets) == 1:
+    fig, axes = plt.subplots(len(assets_selected), 1, figsize=(10, 7), sharex=True)
+    if len(assets_selected) == 1:
         axes = [axes]
 
     sensitivities = {}
 
-    for i, asset in enumerate(selected_assets):
-        ticker = ASSETS[asset]
-        data, freq = get_market_data(ticker, event_date)
-        aligned = align_event(data, event_date)
+    for i, asset in enumerate(assets_selected):
+        df, freq = get_market_data(ASSETS[asset], event_date)
+        aligned = align_event(df, event_date)
 
         axes[i].plot(aligned.index, aligned["Close"])
         axes[i].axvline(0, linestyle="--")
@@ -192,8 +213,8 @@ if risk_mode == "Event Reaction":
     plt.xlabel("Minutes from Event")
     st.pyplot(fig)
 
-# ---------- MACRO VAR ----------
-elif risk_mode == "Macro VaR":
+# ---------------- MACRO VAR ----------------
+elif mode == "Macro VaR":
     st.subheader("⚠️ Macro-Conditioned VaR")
 
     returns = daily_returns("^NSEI")
@@ -206,21 +227,18 @@ elif risk_mode == "Macro VaR":
     with c2:
         st.metric("VaR 95% (Low Inflation)", f"{round(var_95(lo)*100,2)}%" if len(lo)>5 else "N/A")
 
-# ---------- STRESS TEST ----------
+# ---------------- STRESS TEST ----------------
 else:
     st.subheader("💥 Portfolio Stress Test")
 
     shock = st.slider("Macro Shock (%)", -2.0, 2.0, 1.0)
-    sensitivities = {}
-
-    for asset in selected_assets:
-        data, _ = get_market_data(ASSETS[asset], event_date)
-        aligned = align_event(data, event_date)
-        sensitivities[asset] = reaction_return(aligned)
 
     impact = 0
     for asset, w in PORTFOLIO_WEIGHTS.items():
-        if asset in sensitivities and not np.isnan(sensitivities[asset]):
-            impact += w * sensitivities[asset] * shock
+        df, _ = get_market_data(ASSETS[asset], event_date)
+        aligned = align_event(df, event_date)
+        s = reaction_return(aligned)
+        if not np.isnan(s):
+            impact += w * s * shock
 
     st.metric("Estimated Portfolio Impact (%)", round(impact, 2))
