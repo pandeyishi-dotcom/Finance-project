@@ -1,6 +1,5 @@
 # ============================================================
-# INDIAN MACRO EVENT & RISK ANALYTICS DASHBOARD
-# (DEFENSIVE, INDEX-SAFE, PRODUCTION-GRADE)
+# CROSS-ASSET CORRELATION ANOMALY DETECTOR
 # ============================================================
 
 import streamlit as st
@@ -8,261 +7,124 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
-import pytz
-import time
 
 # ---------------- PAGE CONFIG ----------------
 st.set_page_config(
-    page_title="Indian Macro Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="Cross-Asset Correlation Monitor",
+    layout="wide"
 )
 
-IST = pytz.timezone("Asia/Kolkata")
-
-# ---------------- ASSETS ----------------
+# ---------------- ASSET UNIVERSE ----------------
 ASSETS = {
-    "NIFTY 50": "^NSEI",
-    "USD/INR": "USDINR=X",
-    "India 10Y G-Sec": "IN10Y-GB",
-    "India VIX": "^INDIAVIX"
+    "Equities (S&P 500)": "^GSPC",
+    "US Dollar (DXY)": "DX-Y.NYB",
+    "US 10Y Yield": "^TNX",
+    "Crude Oil (WTI)": "CL=F"
 }
 
-PORTFOLIO_WEIGHTS = {
-    "NIFTY 50": 0.5,
-    "USD/INR": 0.3,
-    "India 10Y G-Sec": 0.2
-}
-
-# ---------------- CPI DATA ----------------
+# ---------------- DATA LOADER ----------------
 @st.cache_data
-def load_cpi():
-    df = pd.DataFrame({
-        "Date": [
-            "2023-08-14","2023-09-12","2023-10-12",
-            "2023-11-13","2023-12-12",
-            "2024-01-12","2024-02-12","2024-03-12",
-            "2024-04-12","2024-05-13","2024-06-12"
-        ],
-        "Actual": [7.44,6.83,4.87,5.55,5.69,5.69,5.10,4.85,4.83,4.75,4.25],
-        "Forecast": [6.80,6.70,5.10,5.60,5.40,5.80,5.20,5.00,4.90,4.80,4.30]
-    })
-    df["Date"] = pd.to_datetime(df["Date"])
-    df["Surprise"] = df["Actual"] - df["Forecast"]
-    return df.sort_values("Date")
+def load_prices(tickers):
+    data = yf.download(
+        list(tickers.values()),
+        period="5y",
+        interval="1d",
+        progress=False
+    )["Close"]
+    data.columns = tickers.keys()
+    return data.dropna()
 
-# ---------------- REGIME ----------------
-def inflation_regime(x):
-    if x >= 6:
-        return "High Inflation"
-    elif x <= 4:
-        return "Low Inflation"
-    else:
-        return "Mid Inflation"
+# ---------------- CORRELATION LOGIC ----------------
+def rolling_correlation(data, window):
+    returns = data.pct_change().dropna()
+    return returns.rolling(window).corr()
 
-# ---------------- EVENT STATE ----------------
-def macro_state(date):
-    release = IST.localize(datetime(date.year, date.month, date.day, 17, 30))
-    now = datetime.now(IST)
-    if now < release:
-        return "PRE"
-    elif now <= release + timedelta(minutes=60):
-        return "LIVE"
-    else:
-        return "POST"
-
-# ---------------- MARKET DATA ----------------
-def get_market_data(ticker, event_date):
-    now = pd.Timestamp.utcnow().tz_localize(None)
-    event_date = pd.to_datetime(event_date)
-
-    try:
-        if (now - event_date).days <= 30:
-            df = yf.download(
-                ticker,
-                event_date - timedelta(hours=2),
-                event_date + timedelta(hours=2),
-                interval="1m",
-                progress=False
-            )
-            if not df.empty:
-                return df, "1m"
-
-        df = yf.download(
-            ticker,
-            event_date - timedelta(days=2),
-            event_date + timedelta(days=2),
-            interval="5m",
-            progress=False
-        )
-        if not df.empty:
-            return df, "5m"
-
-        df = yf.download(
-            ticker,
-            event_date - timedelta(days=10),
-            event_date + timedelta(days=10),
-            interval="1d",
-            progress=False
-        )
-        return df, "1d"
-    except:
-        return pd.DataFrame(), "NA"
-
-def align_event(df, event_date):
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
-    df["t"] = (df.index - event_date).total_seconds() / 60
-    return df.set_index("t")
-
-def reaction_return(df):
-    try:
-        pre = df.loc[df.index < 0]["Close"].iloc[-1]
-        post = df.loc[df.index > 0]["Close"].iloc[0]
-        return float((post / pre - 1) * 100)
-    except:
-        return np.nan
-
-# ---------------- DAILY RETURNS ----------------
-@st.cache_data
-def daily_returns(ticker):
-    df = yf.download(ticker, period="5y", interval="1d", progress=False)
-    r = df["Close"].pct_change()
-    return r.dropna()
-
-def var_95(x):
-    return np.percentile(x, 5)
+def correlation_zscore(rolling_corr, long_window=252):
+    mean = rolling_corr.rolling(long_window).mean()
+    std = rolling_corr.rolling(long_window).std()
+    return (rolling_corr - mean) / std
 
 # ================= SIDEBAR =================
-st.sidebar.title("📊 Macro Control Panel")
+st.sidebar.title("🔗 Correlation Controls")
 
-cpi = load_cpi()
-cpi["Regime"] = cpi["Actual"].apply(inflation_regime)
-
-event_date = st.sidebar.selectbox("CPI Release Date", cpi["Date"])
-row = cpi[cpi["Date"] == event_date].iloc[0]
-
-st.sidebar.metric("Inflation", row["Actual"])
-st.sidebar.metric("Surprise", round(row["Surprise"], 2))
-st.sidebar.metric("Regime", row["Regime"])
-st.sidebar.metric("State", macro_state(event_date))
-
-assets = st.sidebar.multiselect(
-    "Assets",
-    list(ASSETS.keys()),
-    default=list(ASSETS.keys())
+window = st.sidebar.slider(
+    "Rolling Correlation Window (days)",
+    min_value=20,
+    max_value=120,
+    value=30
 )
 
-mode = st.sidebar.radio(
-    "Mode",
-    ["Event Reaction", "Shock vs Drift", "Volatility", "Macro VaR", "Stress Test"]
+z_thresh = st.sidebar.slider(
+    "Anomaly Threshold (|Z|)",
+    min_value=1.0,
+    max_value=3.0,
+    value=2.0,
+    step=0.1
 )
 
 # ================= MAIN =================
-st.title("🇮🇳 Indian Macro Analytics Dashboard")
+st.title("📊 Cross-Asset Correlation Anomaly Detector")
+st.caption("Tracks when asset relationships break from historical norms")
 
-if macro_state(event_date) == "LIVE":
-    time.sleep(30)
-    st.experimental_rerun()
+prices = load_prices(ASSETS)
+returns = prices.pct_change().dropna()
 
-# ---------------- EVENT REACTION ----------------
-if mode == "Event Reaction":
-    sensitivities = {}
+# Rolling correlations
+roll_corr = rolling_correlation(prices, window)
 
-    fig, axes = plt.subplots(len(assets), 1, figsize=(10, 7), sharex=True)
-    if len(assets) == 1:
-        axes = [axes]
+# Z-scores of correlations
+corr_z = correlation_zscore(roll_corr)
 
-    for i, asset in enumerate(assets):
-        df, freq = get_market_data(ASSETS[asset], event_date)
-        if df.empty:
-            sensitivities[asset] = np.nan
-            axes[i].set_title(f"{asset} (no data)")
-            continue
+# Latest snapshot
+latest_date = corr_z.index.get_level_values(0).max()
+latest_corr = corr_z.loc[latest_date]
 
-        al = align_event(df, event_date)
-        axes[i].plot(al.index, al["Close"])
-        axes[i].axvline(0, linestyle="--")
-        axes[i].set_title(f"{asset} ({freq})")
+# ---------------- ANOMALY TABLE ----------------
+st.subheader("🚨 Correlation Anomalies (Latest)")
 
-        sensitivities[asset] = reaction_return(al)
+anomalies = (
+    latest_corr
+    .reset_index()
+    .rename(columns={0: "Z-Score"})
+    .query("Asset1 != Asset2")
+)
 
-    plt.xlabel("Minutes from Event")
-    st.pyplot(fig)
+anomalies = anomalies[anomalies["Z-Score"].abs() >= z_thresh]
+anomalies = anomalies.sort_values("Z-Score", key=abs, ascending=False)
 
-    # SAFE sorting
-    sens_series = pd.Series(sensitivities, dtype="float64").dropna()
-    st.subheader("📊 Asset Sensitivity Ranking")
-    st.dataframe(sens_series.sort_values(ascending=False))
+st.dataframe(anomalies, use_container_width=True)
 
-# ---------------- SHOCK VS DRIFT ----------------
-elif mode == "Shock vs Drift":
-    rows = []
+# ---------------- HEATMAP ----------------
+st.subheader("🧠 Current Correlation Regime")
 
-    for asset in assets:
-        df, _ = get_market_data(ASSETS[asset], event_date)
-        if df.empty:
-            continue
+current_corr = returns.corr()
 
-        al = align_event(df, event_date)
-        shock = al.loc[(al.index > 0) & (al.index <= 15)]["Close"].pct_change().sum()
-        drift = al.loc[(al.index > 15) & (al.index <= 60)]["Close"].pct_change().sum()
+fig, ax = plt.subplots(figsize=(6,5))
+im = ax.imshow(current_corr, cmap="coolwarm", vmin=-1, vmax=1)
+ax.set_xticks(range(len(current_corr.columns)))
+ax.set_yticks(range(len(current_corr.columns)))
+ax.set_xticklabels(current_corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(current_corr.columns)
+fig.colorbar(im, ax=ax)
+st.pyplot(fig)
 
-        rows.append([asset, round(float(shock*100),2), round(float(drift*100),2)])
+# ---------------- TIME-SERIES VIEW ----------------
+st.subheader("📈 Correlation Time Series")
 
-    st.table(pd.DataFrame(rows, columns=["Asset", "Shock %", "Drift %"]))
+pair = st.selectbox(
+    "Select Asset Pair",
+    [(a,b) for a in ASSETS for b in ASSETS if a != b]
+)
 
-# ---------------- VOLATILITY ----------------
-elif mode == "Volatility":
-    df, _ = get_market_data("^INDIAVIX", event_date)
-    if not df.empty:
-        al = align_event(df, event_date)
-        st.line_chart(al["Close"])
-        vol_shock = al.loc[al.index > 0]["Close"].pct_change().sum()
-        st.metric("Volatility Shock (%)", round(float(vol_shock*100),2))
-    else:
-        st.info("No volatility data available.")
+pair_corr = (
+    roll_corr
+    .xs(pair[0], level=1)
+    .xs(pair[1], level=1)
+)
 
-# ---------------- MACRO VAR ----------------
-elif mode == "Macro VaR":
-    r = daily_returns("^NSEI")
-
-    regime_map = cpi[["Date", "Regime"]].reset_index(drop=True)
-    daily_regime = pd.Series(index=r.index, dtype="object")
-
-    for i in range(len(regime_map)):
-        start = regime_map.loc[i, "Date"]
-        end = regime_map.loc[i+1, "Date"] if i+1 < len(regime_map) else r.index.max()
-        daily_regime.loc[(daily_regime.index >= start) & (daily_regime.index < end)] = regime_map.loc[i, "Regime"]
-
-    df = pd.DataFrame({
-        "Returns": r,
-        "Regime": daily_regime
-    }).dropna()
-
-    hi = df[df["Regime"] == "High Inflation"]["Returns"]
-    lo = df[df["Regime"] == "Low Inflation"]["Returns"]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric("VaR 95% (High Inflation)", f"{round(var_95(hi)*100,2)}%" if len(hi)>30 else "N/A")
-    with c2:
-        st.metric("VaR 95% (Low Inflation)", f"{round(var_95(lo)*100,2)}%" if len(lo)>30 else "N/A")
-
-# ---------------- STRESS TEST ----------------
-else:
-    shock = st.slider("Macro Shock (%)", -2.0, 2.0, 1.0)
-
-    impact = 0.0
-    for asset, w in PORTFOLIO_WEIGHTS.items():
-        df, _ = get_market_data(ASSETS[asset], event_date)
-        if df.empty:
-            continue
-
-        al = align_event(df, event_date)
-        s = reaction_return(al)
-        if not np.isnan(s):
-            impact += float(w * s * shock)
-
-    st.metric("Estimated Portfolio Impact (%)", round(impact, 2))
+fig2, ax2 = plt.subplots(figsize=(10,4))
+ax2.plot(pair_corr, label="Rolling Correlation")
+ax2.axhline(pair_corr.mean(), linestyle="--", color="gray", label="Long-term Mean")
+ax2.set_title(f"{pair[0]} vs {pair[1]}")
+ax2.legend()
+st.pyplot(fig2)
