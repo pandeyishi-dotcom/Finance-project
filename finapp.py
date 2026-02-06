@@ -1,27 +1,21 @@
 # ============================================================
-# INDIAN MACRO EVENT IMPACT LAB (FIXED & ROBUST)
+# INDIAN MACRO RISK & EVENT ANALYTICS LAB
 # ============================================================
 
 import streamlit as st
-import tradingeconomics as te
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from datetime import timedelta
 
 # ---------------- PAGE CONFIG ----------------
-st.set_page_config(
-    page_title="Indian Macro Impact Tracker",
-    layout="wide"
-)
+st.set_page_config(page_title="Indian Macro Risk Lab", layout="wide")
 
-# ---------------- API LOGIN ----------------
-# Strongly recommended: replace with your own key
-te.login("guest:guest")
+# ---------------- CONSTANTS ----------------
+WINDOW_MINUTES = 120
 
-# ---------------- CONFIG ----------------
 ASSETS = {
     "USD/INR": "USDINR=X",
     "NIFTY 50": "^NSEI",
@@ -34,60 +28,34 @@ PORTFOLIO_WEIGHTS = {
     "India 10Y G-Sec": 0.25
 }
 
-WINDOW_MINUTES = 120
-
-# ---------------- FUNCTIONS ----------------
+# ---------------- DATA LOADERS ----------------
 @st.cache_data
-def get_cpi_events():
-    """
-    Pull Indian CPI events safely from TradingEconomics.
-    Falls back gracefully if API returns bad or empty data.
-    """
-    try:
-        data = te.getCalendarData(
-            country="India",
-            initDate="2023-01-01"
-        )
+def load_mospi_cpi():
+    df = pd.read_csv("india_cpi_events.csv")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Surprise"] = df["Actual"] - df["Forecast"]
+    return df.sort_values("Date", ascending=False)
 
-        if not data:
-            return pd.DataFrame()
+@st.cache_data
+def load_rbi_mpc():
+    df = pd.read_csv("rbi_mpc_dates.csv")
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df
 
-        df = pd.DataFrame(data)
-
-        # Defensive checks
-        required_cols = {"Date", "Actual", "Forecast", "Event"}
-        if not required_cols.issubset(df.columns):
-            return pd.DataFrame()
-
-        # Filter CPI events manually (API naming is inconsistent)
-        df = df[df["Event"].str.contains("CPI", case=False, na=False)]
-
-        df = df[["Date", "Actual", "Forecast"]].dropna()
-        df["Date"] = pd.to_datetime(df["Date"])
-        df["Surprise"] = df["Actual"] - df["Forecast"]
-
-        return df.sort_values("Date", ascending=False)
-
-    except Exception:
-        return pd.DataFrame()
-
+# ---------------- MARKET FUNCTIONS ----------------
 def get_market_data(ticker, event_time):
     start = event_time - timedelta(minutes=WINDOW_MINUTES)
     end = event_time + timedelta(minutes=WINDOW_MINUTES)
+    data = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        interval="1m",
+        progress=False
+    )
+    return data.dropna()
 
-    try:
-        data = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            interval="1m",
-            progress=False
-        )
-        return data.dropna()
-    except Exception:
-        return pd.DataFrame()
-
-def align_event_time(df, event_time):
+def align_event(df, event_time):
     df = df.copy()
     df["t"] = (df.index - event_time).total_seconds() / 60
     return df.set_index("t")
@@ -97,85 +65,135 @@ def reaction_return(df, minutes=60):
         pre = df.loc[-30:0]["Close"].iloc[0]
         post = df.loc[0:minutes]["Close"].iloc[-1]
         return (post / pre - 1) * 100
-    except Exception:
+    except:
         return np.nan
 
-# ---------------- UI ----------------
-st.title("🇮🇳 Indian Macro Event Impact Tracker")
-st.caption("CPI → INR → Equities → G-Secs | Event-time analysis")
+# ---------------- REGIME LOGIC ----------------
+def inflation_regime(cpi):
+    if cpi >= 6:
+        return "High Inflation"
+    elif cpi <= 4:
+        return "Low Inflation"
+    else:
+        return "Mid Regime"
 
-events = get_cpi_events()
+# ---------------- DAILY RETURNS ----------------
+@st.cache_data
+def daily_returns(ticker):
+    data = yf.download(ticker, period="5y", interval="1d", progress=False)
+    return data["Close"].pct_change().dropna()
 
-if events.empty:
-    st.warning("No CPI data available from TradingEconomics API.")
-    st.stop()
+def var_95(returns):
+    return np.percentile(returns, 5)
 
-event_date = st.selectbox("Select CPI Release Date", events["Date"])
-event_row = events[events["Date"] == event_date].iloc[0]
+# ================= STREAMLIT UI =================
+st.title("🇮🇳 Indian Macro Risk & Event Analytics Lab")
+st.caption("MOSPI CPI • RBI MPC • Event-Time Markets • Regimes • Macro VaR")
 
-st.metric("CPI Surprise", round(event_row["Surprise"], 2))
+# ---------- LOAD DATA ----------
+cpi_events = load_mospi_cpi()
+mpc_events = load_rbi_mpc()
 
-# ---------------- CROSS-ASSET REACTION ----------------
-st.subheader("📊 Cross-Asset Reaction (Event-Time Aligned)")
+cpi_events["Regime"] = cpi_events["Actual"].apply(inflation_regime)
+
+# ---------- EVENT SELECTION ----------
+event_type = st.selectbox("Select Event Type", ["CPI Release", "RBI MPC"])
+
+if event_type == "CPI Release":
+    event_date = st.selectbox("Select CPI Date", cpi_events["Date"])
+    event_row = cpi_events[cpi_events["Date"] == event_date].iloc[0]
+    st.metric("CPI Surprise", round(event_row["Surprise"], 2))
+    st.metric("Inflation Regime", event_row["Regime"])
+else:
+    event_date = st.selectbox("Select MPC Date", mpc_events["Date"])
+    st.metric("Policy Event", "RBI MPC Decision")
+
+# ---------- CROSS-ASSET REACTION ----------
+st.subheader("📊 Cross-Asset Event-Time Reaction")
 
 fig, axes = plt.subplots(len(ASSETS), 1, figsize=(10, 8), sharex=True)
-asset_returns = {}
+asset_sensitivity = {}
 
 for i, (name, ticker) in enumerate(ASSETS.items()):
-    raw = get_market_data(ticker, event_date)
-
-    if raw.empty:
+    data = get_market_data(ticker, event_date)
+    if data.empty:
         axes[i].set_title(f"{name} (no data)")
-        asset_returns[name] = np.nan
+        asset_sensitivity[name] = np.nan
         continue
 
-    aligned = align_event_time(raw, event_date)
-
+    aligned = align_event(data, event_date)
     axes[i].plot(aligned.index, aligned["Close"])
     axes[i].axvline(0, linestyle="--")
     axes[i].set_title(name)
 
-    asset_returns[name] = reaction_return(aligned)
+    asset_sensitivity[name] = reaction_return(aligned)
 
-plt.xlabel("Minutes from CPI Release")
+plt.xlabel("Minutes from Event")
 st.pyplot(fig)
 
-# ---------------- REGRESSION ----------------
-st.subheader("📈 CPI Surprise → INR Reaction Regression")
+# ---------- REGRESSION ----------
+st.subheader("📈 CPI Surprise → INR Reaction")
 
-regression_data = []
+reg_data = []
 
-for _, row in events.iterrows():
+for _, row in cpi_events.iterrows():
     raw = get_market_data("USDINR=X", row["Date"])
     if raw.empty:
         continue
-
-    aligned = align_event_time(raw, row["Date"])
+    aligned = align_event(raw, row["Date"])
     ret = reaction_return(aligned)
-
     if not np.isnan(ret):
-        regression_data.append([row["Surprise"], ret])
+        reg_data.append([row["Surprise"], ret])
 
-reg_df = pd.DataFrame(regression_data, columns=["Surprise", "INR_Return"])
+reg_df = pd.DataFrame(reg_data, columns=["Surprise", "INR_Return"])
 
-if len(reg_df) < 5:
-    st.info("Not enough observations for regression.")
-else:
+if len(reg_df) > 5:
     X = sm.add_constant(reg_df["Surprise"])
     model = sm.OLS(reg_df["INR_Return"], X).fit()
     st.text(model.summary())
+else:
+    st.info("Not enough CPI events for regression.")
 
-# ---------------- STRESS TEST ----------------
-st.subheader("⚠️ Portfolio Stress Test (Macro Shock)")
+# ---------- REGIME ANALYSIS ----------
+st.subheader("🧭 Inflation Regime Breakdown")
+st.write(cpi_events.groupby("Regime").size().rename("Number of Events"))
 
-shock = st.slider("Assumed CPI Shock (%)", -2.0, 2.0, 1.0)
+# ---------- MACRO-CONDITIONED VAR ----------
+st.subheader("⚠️ Macro-Conditioned VaR (NIFTY)")
+
+returns = daily_returns("^NSEI")
+
+high_inf_dates = cpi_events[cpi_events["Regime"] == "High Inflation"]["Date"]
+low_inf_dates = cpi_events[cpi_events["Regime"] == "Low Inflation"]["Date"]
+
+high_inf_returns = returns[returns.index.isin(high_inf_dates)]
+low_inf_returns = returns[returns.index.isin(low_inf_dates)]
+
+col1, col2 = st.columns(2)
+
+with col1:
+    if len(high_inf_returns) > 10:
+        st.metric("VaR 95% (High Inflation)", f"{round(var_95(high_inf_returns)*100,2)}%")
+    else:
+        st.metric("VaR 95% (High Inflation)", "Insufficient data")
+
+with col2:
+    if len(low_inf_returns) > 10:
+        st.metric("VaR 95% (Low Inflation)", f"{round(var_95(low_inf_returns)*100,2)}%")
+    else:
+        st.metric("VaR 95% (Low Inflation)", "Insufficient data")
+
+# ---------- PORTFOLIO STRESS TEST ----------
+st.subheader("💥 Portfolio Stress Test (Macro Shock)")
+
+shock = st.slider("Assumed Macro Shock (%)", -2.0, 2.0, 1.0)
 
 portfolio_impact = 0
 for asset, weight in PORTFOLIO_WEIGHTS.items():
-    sensitivity = asset_returns.get(asset, 0)
-    if not np.isnan(sensitivity):
-        portfolio_impact += weight * sensitivity * shock
+    sens = asset_sensitivity.get(asset, 0)
+    if not np.isnan(sens):
+        portfolio_impact += weight * sens * shock
 
 st.metric("Estimated Portfolio Impact (%)", round(portfolio_impact, 2))
 
-st.caption("Stress test uses historical CPI reaction sensitivities")
+st.caption("Stress test uses event-time sensitivities conditioned on macro regime")
