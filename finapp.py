@@ -1,5 +1,6 @@
 # ============================================================
-# INDIAN MACRO EVENT & RISK ANALYTICS LAB (PRODUCTION-SAFE)
+# INDIAN MACRO EVENT & RISK ANALYTICS LAB
+# (FULLY FIXED – TIMEZONE + DATA SAFE)
 # ============================================================
 
 import streamlit as st
@@ -66,9 +67,11 @@ def inflation_regime(cpi):
 
 # ---------------- ADAPTIVE MARKET DATA ----------------
 def get_market_data(ticker, event_date):
-    now = pd.Timestamp.utcnow()
+    # FIX: make both timestamps timezone-naive
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    event_date = pd.to_datetime(event_date)
 
-    # 1️⃣ Minute data (recent only)
+    # 1️⃣ 1-minute data (recent only)
     if (now - event_date).days <= 30:
         df = yf.download(
             ticker,
@@ -80,7 +83,7 @@ def get_market_data(ticker, event_date):
         if not df.empty:
             return df.dropna(), "1-minute"
 
-    # 2️⃣ 5-minute data (historical intraday)
+    # 2️⃣ 5-minute intraday (historical)
     df = yf.download(
         ticker,
         start=event_date - timedelta(days=2),
@@ -91,7 +94,7 @@ def get_market_data(ticker, event_date):
     if not df.empty:
         return df.dropna(), "5-minute"
 
-    # 3️⃣ Daily fallback (always available)
+    # 3️⃣ Daily fallback (always works)
     df = yf.download(
         ticker,
         start=event_date - timedelta(days=10),
@@ -124,7 +127,7 @@ def daily_returns(ticker):
 def var_95(returns):
     return np.percentile(returns, 5)
 
-# ================= UI =================
+# ================= STREAMLIT UI =================
 st.title("🇮🇳 Indian Macro Event & Risk Analytics Lab")
 st.caption("Adaptive frequency • CPI & RBI • Regimes • Macro VaR")
 
@@ -152,8 +155,8 @@ sensitivities = {}
 
 for i, (name, ticker) in enumerate(ASSETS.items()):
     data, freq = get_market_data(ticker, event_date)
-
     aligned = align_event(data, event_date)
+
     axes[i].plot(aligned.index, aligned["Close"])
     axes[i].axvline(0, linestyle="--")
     axes[i].set_title(f"{name} ({freq})")
@@ -163,7 +166,7 @@ for i, (name, ticker) in enumerate(ASSETS.items()):
 plt.xlabel("Minutes from Event")
 st.pyplot(fig)
 
-# ---------------- REGRESSION (DAILY, ROBUST) ----------------
+# ---------------- REGRESSION (DAILY – ROBUST) ----------------
 st.subheader("📈 CPI Surprise → INR Reaction (Daily)")
 
 reg_data = []
@@ -198,11 +201,11 @@ lo = returns[returns.index.isin(lo_dates)]
 
 c1, c2 = st.columns(2)
 with c1:
-    st.metric("VaR 95% (High Inflation)", f"{round(var_95(hi)*100,2)}%" if len(hi)>5 else "N/A")
+    st.metric("VaR 95% (High Inflation)", f"{round(var_95(hi)*100,2)}%" if len(hi) > 5 else "N/A")
 with c2:
-    st.metric("VaR 95% (Low Inflation)", f"{round(var_95(lo)*100,2)}%" if len(lo)>5 else "N/A")
+    st.metric("VaR 95% (Low Inflation)", f"{round(var_95(lo)*100,2)}%" if len(lo) > 5 else "N/A")
 
-# ---------------- PORTFOLIO STRESS ----------------
+# ---------------- PORTFOLIO STRESS TEST ----------------
 st.subheader("💥 Portfolio Stress Test")
 
 shock = st.slider("Macro Shock (%)", -2.0, 2.0, 1.0)
